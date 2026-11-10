@@ -307,7 +307,8 @@ def simular_iteracion(A, P, scen, idx, rng, con_detalle=False):
             Parada_base_h=Pa.ravel(), Parada_DSS_h=Pa_n.ravel(), Operativo_base_h=To.ravel(),
             Operativo_DSS_h=To_n.ravel(), Procesados=Proc_n.ravel().round(1),
             Conformes=Conf_n.ravel().round(1), No_conformes=NC_n.ravel().round(1),
-            Causa_DSS=causa_ef.ravel()))
+            Causa_DSS=causa_ef.ravel(), Estacion_ID=pl["est"].to_numpy(), Tiempo_Planificado_h=Tp.ravel(),
+            Capacidad_Nominal_bidones_h=cap.ravel()))
         detalle["mes"] = np.repeat(mes, 3)
     return fact, detalle
 
@@ -316,21 +317,24 @@ def ejecutar_experimento(df, P, n_it, semilla, escenarios, progreso):
     """Corre n_it iteraciones por escenario (mismos dias muestreados en cada
     escenario dentro de una iteracion: comparacion pareada)."""
     A = preparar_sim(df)
-    hechos, detalles = [], []
+    hechos, detalles, det_dss = [], [], {}
     for s in escenarios:
         for it in range(n_it):
             idx = muestrear_dias(A, np.random.default_rng([int(semilla), it]))
             rng = np.random.default_rng([int(semilla), it, s + 1])
-            f, d = simular_iteracion(A, P, s, idx, rng, con_detalle=(it == 0))
+            f, d = simular_iteracion(A, P, s, idx, rng, con_detalle=(it == 0 or s == 2))
             f["it"], f["scen"] = it, s
             hechos.append(f)
             if d is not None:
                 d["scen"] = s
-                detalles.append(d)
+                if it == 0:
+                    detalles.append(d.copy())
+                if s == 2:                         # iteraciones del DSS completo: sirven para estimar el periodo después
+                    det_dss[it] = d
             progreso(s, it + 1, n_it)
     return dict(fact=pd.concat(hechos, ignore_index=True),
                 detalle=pd.concat(detalles, ignore_index=True), n_it=n_it,
-                semilla=semilla, escenarios=list(escenarios), P=dict(P))
+                semilla=semilla, escenarios=list(escenarios), P=dict(P), det_dss=det_dss, fechas=A["fechas"])
 
 
 def fact_base(df):
@@ -1204,10 +1208,16 @@ def _leeme(ruta: str, mtime: float):
 
 
 def listar_casos_prueba():
-    salida = []
-    for f in sorted(RUTA_BASE.parent.glob("Base_0*.xlsx")):
-        titulo, caso, ver = _leeme(str(f), f.stat().st_mtime)
-        salida.append(dict(ruta=f, nombre=f.name, titulo=titulo or f.stem.replace("_", " "), caso=caso, ver=ver))
+    salida, vistos = [], set()
+    carpetas = [RUTA_BASE.parent, RUTA_BASE.parent.parent / "Data de validación"]     # los Escenario_*.xlsx pueden estar en una carpeta vecina
+    for carpeta in carpetas:
+        for patron in ("Base_0*.xlsx", "Escenario_*.xlsx"):
+            for f in sorted(carpeta.glob(patron)):
+                if f.name in vistos:
+                    continue
+                vistos.add(f.name)
+                titulo, caso, ver = _leeme(str(f), f.stat().st_mtime)
+                salida.append(dict(ruta=f, nombre=f.name, titulo=titulo or f.stem.replace("_", " "), caso=caso, ver=ver))
     return salida
 
 
@@ -1279,6 +1289,9 @@ def activar_datos(df, origen, archivo, detalle=""):
     s.datos = dict(df=df, origen=origen, archivo=archivo, detalle=detalle, ini=df["Fecha"].min(),
                    fin=df["Fecha"].max(), dias=int(df["Fecha"].nunique()))
     s.casos, s.caso_seq, s.wz = [], 0, None
+    s.registro_plan = []
+    if (s.get("despues") or {}).get("modo") == "simulado":
+        s.pop("despues", None)
     s.umb = referencias_p10_p90(df)
     s.umb_ver = s.get("umb_ver", 0) + 1
     for k in ("v_res", "v_xlsx", "dia_tipico", "errores_carga", "avisos_carga"):
@@ -1304,6 +1317,9 @@ T7 = {  # Tabla 7 de la tesis: decisión inmediata, responsable y plazo por tipo
                         resp="Mantenimiento", plazo="Inmediato o en el turno", roles=["Mantenimiento", "Operador"]),
     "insumos": dict(nombre="Parada por falta de insumos", decision="Registrar la causa, avisar a Logística y resecuenciar la producción",
                     resp="Logística (fuera del alcance)", plazo="Mismo día", roles=["Jefe de Producción"]),
+    "plan": dict(nombre="Medición del plan de mantenimiento fuera del criterio", decision="Aplicar la acción del plan y abrir el caso",
+                 resp="Operador avisa; Mantenimiento según prioridad C3", plazo="Según la prioridad (C3)",
+                 roles=["Operador", "Mantenimiento"]),
     "sensor": dict(nombre="Variable de sensor fuera de rango (C1)", decision="Abrir el evento y diagnosticar por NPR (C2)",
                    resp="Operador avisa; Mantenimiento según prioridad C3", plazo="Según la prioridad (C3)",
                    roles=["Operador", "Mantenimiento"]),
@@ -1409,7 +1425,7 @@ def causas_para_alerta(al, ajustes, descartadas):
     e, tipo = al["est"], al["tipo"]
     if tipo == "insumos":
         return []
-    if tipo == "sensor":
+    if al.get("sensor_ref"):                                 # sensores y tareas del plan ligadas a una causa del AMEF
         triples = [tuple(al["sensor_ref"])]
     else:
         if tipo in ("parada", "recurrencia"):
@@ -1461,7 +1477,7 @@ def decision_info(al, c, c3):
     causa = c["causa"][:1].lower() + c["causa"][1:]
     plazo_c3 = plazo_prio(prio, tpm)
     prio_txt = f"{prio} · mantenimiento {tpm.lower()}"
-    if al["tipo"] in ("parada", "recurrencia", "sensor"):
+    if al["tipo"] in ("parada", "recurrencia", "sensor", "plan"):
         if prio == "Crítica":
             accion = f"Detener {est} y hacer el mantenimiento correctivo inmediato {eq}: revisar {causa}"
         elif tpm == "Autónomo":
@@ -1801,10 +1817,13 @@ def kpi(col, etiqueta, valor, sub="", estado=None):
                  f'{sub_html}</div>', unsafe_allow_html=True)
 
 
-def tabla_html(cabeceras, filas):
+def tabla_html(cabeceras, filas, desplazable=False):
     th = "".join(f"<th>{c}</th>" for c in cabeceras)
     tr = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in f) + "</tr>" for f in filas)
-    st.markdown(f'<table class="tbl"><thead><tr>{th}</tr></thead><tbody>{tr}</tbody></table>', unsafe_allow_html=True)
+    tabla = f'<table class="tbl"><thead><tr>{th}</tr></thead><tbody>{tr}</tbody></table>'
+    if desplazable:        # tablas anchas: en pantallas angostas se desplazan en lugar de cortarse
+        tabla = f'<div style="overflow-x:auto">{tabla}</div>'
+    st.markdown(tabla, unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -1812,17 +1831,21 @@ def tabla_html(cabeceras, filas):
 # =============================================================================
 PASOS = [
     ("inicio", "Inicio"),
-    ("kpis", "1. KPIs de entrada"),
+    ("kpis", "1. KPIs y metas"),
     ("datos", "2. Datos"),
     ("params", "3. Parámetros"),
-    ("tablero", "4. Tablero (tendencias y OEE)"),
-    ("decision", "5. Decisión (parte post)"),
-    ("ejecucion", "6. Ejecución y resultante"),
-    ("valid", "7. Validación (Monte Carlo)"),
-    ("export", "8. Exportación"),
+    ("tablero", "4. Resultados iniciales"),
+    ("decision", "5. Decisión"),
+    ("plan", "6. Plan de mantenimiento"),
+    ("ejecucion", "7. Ejecución y verificación"),
+    ("despues", "8. Resultados mejorados"),
+    ("comparativo", "9. Comparativo final"),
+    ("valid", "10. Validación (Monte Carlo)"),
+    ("export", "11. Exportación"),
 ]
 ORDEN = [c for c, _ in PASOS]
 NOMBRE = dict(PASOS)
+BLOQUES = {"tablero": "Bloque antes", "decision": "Bloque mantenimiento", "despues": "Bloque después"}
 
 
 def nombre_corto(clave):
@@ -1841,14 +1864,16 @@ def completo(clave):
     s = st.session_state
     if clave == "inicio":
         return True
-    if clave in ("kpis", "params", "tablero", "export"):
+    if clave in ("kpis", "params", "tablero", "export", "plan", "comparativo"):
         return clave in s.visto
     if clave == "datos":
         return hay_datos()
     if clave == "decision":
         return len(s.casos) > 0
     if clave == "ejecucion":
-        return any(c["estado"] in ("Cerrado", "Reabierto") for c in s.casos)
+        return any(c["estado"] in ("Cerrado", "Reabierto") for c in s.casos) or len(s.get("registro_plan", [])) > 0
+    if clave == "despues":
+        return s.get("despues") is not None
     if clave == "valid":
         return s.get("v_res") is not None
     return False
@@ -1873,8 +1898,20 @@ def bloqueo(clave):
         if not hay_datos():
             return "Primero carga tus datos en el paso 2."
         return None if "tablero" in s.visto else "Primero mira el tablero (paso 4)."
+    if clave == "plan":
+        if not hay_datos():
+            return "Primero carga tus datos en el paso 2."
+        return None if "decision" in s.visto else "Primero revisa las alertas en el paso 5."
     if clave == "ejecucion":
-        return None if s.casos else "Primero confirma una decisión en el paso 5."
+        return None if "plan" in s.visto else "Primero revisa el plan de mantenimiento (paso 6)."
+    if clave == "despues":
+        if not hay_datos():
+            return "Primero carga tus datos en el paso 2."
+        return None if "ejecucion" in s.visto else "Primero registra la ejecución en el paso 7."
+    if clave == "comparativo":
+        if not hay_datos():
+            return "Primero carga tus datos en el paso 2."
+        return None if s.get("despues") is not None else "Primero carga o estima los datos del periodo después en el paso 8."
     return None
 
 
@@ -1934,7 +1971,7 @@ def glosario():
 
 @st.dialog("Guía rápida", width="large")
 def dialogo_guia():
-    st.markdown("#### Los 6 pasos")
+    st.markdown("#### La secuencia en 6 pasos")
     for i, (t, d) in enumerate(PASOS_RAPIDOS, 1):
         st.markdown(f"**{i}. {t}** — {d}")
     st.markdown("#### ¿Quién hace qué?")
@@ -1942,16 +1979,16 @@ def dialogo_guia():
         st.markdown(f"**{rol}**")
         for senal, decide, plazo in filas:
             st.markdown(f"- *{senal}*: {decide} ({plazo}).")
-    st.caption("Los pasos 7 (Validación) y 8 (Exportación) son opcionales y solo piden tener datos cargados.")
+    st.caption("Los pasos 10 (Validación) y 11 (Exportación) son opcionales y solo piden tener datos cargados.")
 
 
 PASOS_RAPIDOS = [
-    ("KPIs de entrada", "mira qué indicadores se miden y cuáles son las metas."),
-    ("Datos", "carga los registros de tu empresa o usa datos de ejemplo."),
-    ("Parámetros", "revisa los umbrales, rangos y reglas (puedes dejar los de la tesis)."),
-    ("Tablero", "mira cómo va la línea: OEE, paradas y rechazo."),
-    ("Decisión", "elige una alerta, entiende la causa y decide qué hacer."),
-    ("Resultante", "comprueba con datos posteriores si la acción funcionó."),
+    ("Cargar datos", "carga los registros de tu empresa o usa datos de ejemplo (pasos 1 a 3)."),
+    ("Situación inicial", "mira cómo va la línea antes del plan de mantenimiento (paso 4)."),
+    ("Plan de mantenimiento", "decide sobre las alertas (paso 5) y sigue el plan con tareas medibles (paso 6)."),
+    ("Ejecución", "registra cada medición y verifica si la acción funcionó (paso 7)."),
+    ("Resultados mejorados", "carga los datos del periodo después o usa la estimación (paso 8)."),
+    ("Comparar", "compara antes y después contra las metas (paso 9)."),
 ]
 
 ROL_DECIDE = {  # (señal / situación, qué decide, plazo) según la Tabla 7 de la tesis
@@ -1984,6 +2021,8 @@ def barra_lateral():
             actual = clave == s.pagina
             marca = "●" if actual else ("✓" if completo(clave) else "○")
             msg = bloqueo(clave)
+            if clave in BLOQUES:
+                st.markdown(f'<div class="eyebrow" style="margin:12px 0 6px">{BLOQUES[clave]}</div>', unsafe_allow_html=True)
             st.button(f"{marca}  {nombre}", key=f"b_nav_{clave}", type="primary" if actual else "secondary", width="stretch",
                       disabled=bool(msg) and not actual, help=msg, on_click=ir, args=(clave,))
             if msg and not actual and not aviso_puesto:   # el motivo de cada bloqueo sale al pasar el cursor; aquí solo el primero
@@ -1995,8 +2034,10 @@ def barra_lateral():
         if d:
             chip = ('<span class="chip emp">DATOS DE LA EMPRESA</span>' if d["origen"] == "Datos de la empresa"
                     else '<span class="chip sin">DATOS SINTÉTICOS</span>')
+            dd = s.get("despues")
+            linea_des = (f'<br>Después: <b>{dd["archivo"]}</b> ({"estimado" if dd["modo"] == "simulado" else "medido"})' if dd else "")
             st.markdown(f'<div class="activos"><div class="eyebrow">Datos activos</div>{chip}<br><b>{d["archivo"]}</b><br>'
-                        f'Periodo: {periodo_txt(d)}<br>Días: {d["dias"]}<br>Casos abiertos: <b>{abiertos}</b></div>',
+                        f'Periodo: {periodo_txt(d)}<br>Días: {d["dias"]}{linea_des}<br>Casos abiertos: <b>{abiertos}</b></div>',
                         unsafe_allow_html=True)
         else:
             st.markdown('<div class="activos"><div class="eyebrow">Datos activos</div>Ninguno todavía.<br>'
@@ -2042,7 +2083,8 @@ def atajo_validacion():
 def pagina_inicio():
     abrir_pagina("inicio", "Plataforma de apoyo a la decisión",
                  "Esta app te ayuda a decidir qué hacer cuando la línea rinde mal. Sigue los pasos del menú de la izquierda, "
-                 "de arriba hacia abajo: primero mira los indicadores, luego carga datos y al final decide y comprueba si funcionó.",
+                 "de arriba hacia abajo: carga los datos, mira la situación inicial, sigue el plan de mantenimiento, registra la ejecución, "
+                 "mira los resultados mejorados y compara.",
                  eyebrow="Agua Bora / Lima, Perú")
     st.markdown('<div class="lead">Línea de envasado de bidones retornables de 20 L con <b>3 estaciones en serie</b>: '
                 'E1 lavado y sanitizado, E2 llenado y tapado, E3 sellado y etiquetado. Un turno diurno de lunes a sábado. '
@@ -2050,9 +2092,12 @@ def pagina_inicio():
     st.write("")
     st.markdown("##### Cómo usar esta app en 5 minutos")
     cols = st.columns(6)
-    textos = [("KPIs", "Mira qué se mide y cuáles son las metas."), ("Datos", "Carga tus registros o usa datos de ejemplo."),
-              ("Parámetros", "Revisa umbrales y reglas (o deja los de la tesis)."), ("Tablero", "Mira cómo va la línea."),
-              ("Decisión", "Elige una alerta y decide qué hacer."), ("Resultante", "Comprueba si la acción funcionó.")]
+    textos = [("Cargar datos", "Mira las metas y carga tus registros o datos de ejemplo."),
+              ("Situación inicial", "Mira cómo va la línea antes del plan."),
+              ("Plan de mantenimiento", "Decide sobre las alertas y sigue las tareas del plan."),
+              ("Ejecución", "Registra cada medición y verifica si funcionó."),
+              ("Resultados mejorados", "Carga los datos del periodo después."),
+              ("Comparar", "Compara antes y después contra las metas.")]
     for i, (col, (t, p)) in enumerate(zip(cols, textos), 1):
         col.markdown(f'<div class="paso-card"><div class="num">{i}</div><div class="t">{t}</div><div class="p">{p}</div></div>',
                      unsafe_allow_html=True)
@@ -2198,7 +2243,8 @@ def pagina_datos():
                 if st.button("Usar este caso de prueba", key="b_usar_caso", type="primary", width="stretch"):
                     df, errs, avisos = leer_ruta_cache(str(elegido["ruta"]), elegido["ruta"].stat().st_mtime)
                     if errs:
-                        st.error("Este archivo no pasó la validación: " + errs[0]["Problema"])
+                        st.error(f"Este archivo no pasó la validación: {len(errs)} problema(s). Se listan por fila y columna.")
+                        st.dataframe(pd.DataFrame(errs)[["Fila", "Columna", "Problema"]], hide_index=True, width="stretch")
                     else:
                         activar_datos(df, "Datos sintéticos", elegido["nombre"], elegido["titulo"])
                         s.avisos_carga = avisos
@@ -2497,7 +2543,7 @@ def _reset_amef():
 
 
 def _tab_supuestos():
-    explica("La validación (paso 7) simula miles de días para estimar cuánto mejoraría la línea con el DSS. Para eso necesita estos números. "
+    explica("La validación (paso 10) simula miles de días para estimar cuánto mejoraría la línea con el DSS. Para eso necesita estos números. "
             "<b>No salen de la base ni de la tesis: son supuestos</b> y puedes cambiarlos para ver qué pasa.")
 
     def num(label, key, mn, mx, paso, formato="%.2f"):
@@ -2548,7 +2594,8 @@ def pagina_params():
                  "Aquí están las reglas que usa la app: cuándo se enciende una alerta, qué rangos vigilan los sensores, "
                  "cómo se califica el riesgo y qué tan urgente es cada causa. Todo viene con los valores de la tesis; "
                  "si no estás seguro, déjalos como están y sigue.")
-    tabs = st.tabs(["Umbrales de alerta", "Detección C1", "Escalas S/O/D", "Matriz de criticidad", "AMEF", "Supuestos Monte Carlo"])
+    tabs = st.tabs(["Umbrales de alerta", "Detección C1", "Escalas S/O/D", "Matriz de criticidad", "AMEF", "Supuestos Monte Carlo",
+                    "Plan de mantenimiento"])
     with tabs[0]:
         _tab_umbrales()
     with tabs[1]:
@@ -2561,6 +2608,8 @@ def pagina_params():
         _tab_amef()
     with tabs[5]:
         _tab_supuestos()
+    with tabs[6]:
+        _tab_plan()
     pie_siguiente("params")
 
 
@@ -2642,8 +2691,9 @@ def serie_oee(df, freq):
     return piv
 
 
-def pestana_tendencias(df):
-    freq = st.radio("Ver por", ["Diario", "Semanal", "Mensual"], horizontal=True, key="w_tend_freq",
+def pestana_tendencias(df, pref="tab"):
+    freq = st.radio("Ver por", ["Diario", "Semanal", "Mensual"], horizontal=True,
+                    key="w_tend_freq" if pref == "tab" else f"w_{pref}_freq",
                     help="Diario muestra mucho ruido; semanal o mensual muestran mejor la tendencia.")
     piv = serie_oee(df, freq)
     fig = go.Figure()
@@ -2698,15 +2748,21 @@ def pestana_rechazo(df, umb):
 
 
 def pagina_tablero():
-    s = st.session_state
-    abrir_pagina("tablero", "Tablero (tendencias y OEE)",
+    abrir_pagina("tablero", "Resultados iniciales: situación inicial, sin el plan de mantenimiento",
                  "Aquí solo ves resultados: cómo va la línea frente a las metas. No hay que decidir nada todavía. "
                  "Cuando termines de mirar, ve al paso 5 para decidir qué hacer con las alertas.")
-    df_all = df_activo()
+    render_tablero(df_activo(), "tab")
+    pie_siguiente("tablero", etiqueta="Ver decisiones para las alertas (paso 5) ›")
+
+
+def render_tablero(df_all, pref="tab"):
+    """Tablero de resultados (resumen, tendencias, por estación, Pareto y rechazo). Sirve para el antes y para el después."""
+    s = st.session_state
+    clave_mes = "w_tab_mes" if pref == "tab" else f"w_{pref}_mes"
     opciones = ["Todos"] + [int(m) for m in sorted(df_all["Mes"].unique())]
-    if s.get("w_tab_mes") not in opciones:
-        s.w_tab_mes = "Todos"
-    mes = st.selectbox("Periodo", opciones, key="w_tab_mes", format_func=lambda m: "Todo el periodo" if m == "Todos" else mes_lbl(m))
+    if s.get(clave_mes) not in opciones:
+        s[clave_mes] = "Todos"
+    mes = st.selectbox("Periodo", opciones, key=clave_mes, format_func=lambda m: "Todo el periodo" if m == "Todos" else mes_lbl(m))
     df = df_all if mes == "Todos" else df_all[df_all["Mes"] == mes]
     tabs = st.tabs(["Resumen", "Tendencias", "Por estación", "Pareto de paradas", "Índice de rechazo"])
     with tabs[0]:
@@ -2735,14 +2791,13 @@ def pagina_tablero():
         st.write("")
         caja(msg, tipo)
     with tabs[1]:
-        pestana_tendencias(df)
+        pestana_tendencias(df, pref)
     with tabs[2]:
-        tabla1(df, "tab")
+        tabla1(df, pref)
     with tabs[3]:
-        grafico_pareto(df, "tab")
+        grafico_pareto(df, pref)
     with tabs[4]:
         pestana_rechazo(df, s.umb)
-    pie_siguiente("tablero", etiqueta="Ver decisiones para las alertas (paso 5) ›")
 
 
 # =============================================================================
@@ -2774,10 +2829,11 @@ def caso_duplicado(al_id, causa):
 
 
 def ir_a_caso(caso_id):
-    """Abre el paso 6 con ese caso ya seleccionado."""
+    """Abre el paso 7 (verificación) con ese caso ya seleccionado."""
     s = st.session_state
     s.pagina = "ejecucion"
     s.w_ej_caso = caso_id
+    s.w_ej_sub = "Verificación de casos (C4)"
     s.wz = None
 
 
@@ -2940,7 +2996,7 @@ def _wizard():
             caja(wz["msg"], "ok")
         else:
             caja(f"Este caso ya está abierto (<b>{id_}</b>).", "warn")
-        st.button("Ir a 6. Ejecución y resultante ›", key="b_wz_ir6", type="primary", width="stretch", on_click=ir_a_caso, args=(id_,))
+        st.button("Ir a 7. Ejecución y verificación ›", key="b_wz_ir6", type="primary", width="stretch", on_click=ir_a_caso, args=(id_,))
     a, b, c_ = st.columns([1, 1, 1.3])
     a.button("‹ Anterior", key="b_wz_prev", width="stretch", disabled=paso == 0, on_click=wz_mover, args=(-1,))
     b.button("Cerrar" if (creado or dup) else "Cancelar", key="b_wz_cancel", width="stretch", on_click=wz_cancelar)
@@ -3175,7 +3231,7 @@ def _sensores():
         else:
             caja(f"Este caso ya está abierto (<b>{dup['id']}</b>).", "warn")
         st.button(f"Caso {dup['id']} ya creado", key="b_caso_sensor", width="stretch", disabled=True)
-        st.button("Ir a 6. Ejecución y resultante ›", key="b_ir6_sensor", type="primary", width="stretch", on_click=ir_a_caso, args=(dup["id"],))
+        st.button("Ir a 7. Ejecución y verificación ›", key="b_ir6_sensor", type="primary", width="stretch", on_click=ir_a_caso, args=(dup["id"],))
     else:
         st.button("Confirmar decisión (crear caso desde el sensor)", key="b_caso_sensor", type="primary", width="stretch",
                   on_click=_crear_caso_sensor, args=(ev, direccion, elegida))
@@ -3185,7 +3241,7 @@ def pagina_decision():
     s = st.session_state
     abrir_pagina("decision", "Decisión (parte post)",
                  "Ya viste el OEE y el rechazo. Aquí decides qué hacer: elige una alerta y sigue 4 pasos cortos (qué pasó, por qué, qué tan urgente "
-                 "y qué decido). Al confirmar se crea un caso que seguirás en el paso 6.")
+                 "y qué decido). Al confirmar se crea un caso que seguirás en el plan de mantenimiento (paso 6) y en la ejecución (paso 7).")
     msg = s.pop("msg_dec", None)
     if msg:
         caja(msg[1], msg[0])
@@ -3197,7 +3253,7 @@ def pagina_decision():
             _lista_alertas()
     with t2:
         _sensores()
-    if not (s.get("wz") and s.wz.get("paso") == 3):      # en el paso 4 de 4 solo queda «Ir a 6…» / «Confirmar decisión»
+    if not (s.get("wz") and s.wz.get("paso") == 3):      # en el paso 4 de 4 solo queda «Ir a 7…» / «Confirmar decisión»
         pie_siguiente("decision", tip="Confirma una decisión para pasar a la ejecución.")
 
 
@@ -3218,13 +3274,15 @@ def cb_verificar():
         return
     if caso["origen"] == "sensor":
         res = verificar_sensor(caso, s.get("w_ej_efecto", "Efectiva"))
+    elif caso["origen"] == "plan":
+        res = verificar_plan(caso)
     else:
         res = verificar_caso(caso, df_activo(), s.umb)
     if res["sin_datos"]:
         s.res_ej = dict(caso_id=caso["id"], res=res, lineas=[], estado=caso["estado"])
         return
     caso["intervenciones"].append(dict(fecha=s.get("w_ej_fecha"), responsable=resp, accion=accion, esperado=res["esperado_txt"],
-                                       observado=res["observado_txt"], ok=res["ok"]))
+                                       observado=res["observado_txt"], ok=res["ok"], ts=pd.Timestamp.now()))
     c = caso["causa"]
     if res["ok"]:
         caso["estado"] = "Cerrado"
@@ -3232,8 +3290,14 @@ def cb_verificar():
             lineas = res["lineas"]
         elif caso["alerta"]["tipo"] == "insumos":
             lineas = ["C1/C2/C3 sin cambios: la causa está fuera del alcance del prototipo."]
+        elif caso["origen"] == "plan" and not c.get("ident"):
+            lineas = ["C1/C2/C3 sin cambios: es una tarea general del plan, sin causa en el AMEF."]
         else:
             lineas = retro_kpi(caso, res, s.umb)
+    elif caso["origen"] == "plan" and not c.get("ident"):
+        res["mantiene"] = True                       # tarea general sin causas alternativas: sigue abierta
+        lineas = ["La medición sigue fuera del criterio: repite la acción, registra una nueva medición en el checklist y verifica otra vez. "
+                  "Si persiste, escala al jefe de Mantenimiento."]
     else:
         caso["estado"] = "Reabierto"
         if c.get("ident"):
@@ -3312,13 +3376,27 @@ def cb_reiniciar_casos():
 
 
 def pagina_ejecucion():
+    abrir_pagina("ejecucion", "Ejecución y verificación",
+                 "Aquí registras cada tarea del plan de mantenimiento (valor medido y si cumple) y compruebas si la acción de cada caso funcionó. "
+                 "Si una medición no cumple, se crea o actualiza un caso solo. Si la acción funcionó, el caso se cierra y el sistema aprende; "
+                 "si no, el caso se reabre con la siguiente causa y vuelves al paso 5.")
+    sub = st.radio("Sección", ["Checklist del plan", "Verificación de casos (C4)"], horizontal=True, key="w_ej_sub",
+                   label_visibility="collapsed")
+    if sub.startswith("Checklist"):
+        checklist_plan()
+    else:
+        verificacion_casos()
+    pie_siguiente("ejecucion")
+
+
+def verificacion_casos():
     s = st.session_state
-    abrir_pagina("ejecucion", "Ejecución y resultante",
-                 "Aquí registras qué hiciste y compruebas, con los datos del periodo siguiente, si la acción funcionó. Si funcionó, el caso se cierra y "
-                 "el sistema aprende; si no, el caso se reabre con la siguiente causa y vuelves al paso 5.")
     msg = s.pop("msg_dec", None)
     if msg:
         caja(msg[1], msg[0])
+    if not s.casos:
+        caja("Todavía no hay casos. Se crean en el paso 5 o cuando una medición del checklist no cumple el criterio.", "info")
+        return
     filas = []
     for c in s.casos:
         bg, fg = ESTADO_COL[c["estado"]]
@@ -3354,8 +3432,9 @@ def pagina_ejecucion():
         ids = [c["id"] for c in abiertos]
         if s.get("w_ej_caso") not in ids:
             s.w_ej_caso = ids[0]
-        caso = next(c for c in abiertos if c["id"] == st.selectbox("Caso a verificar", ids, key="w_ej_caso",
-                                                                    format_func=lambda i: f"{i} · {next(c for c in abiertos if c['id'] == i)['alerta']['senal']}"))
+        id_sel = st.selectbox("Caso a verificar", ids, key="w_ej_caso",
+                              format_func=lambda i: f"{i} · {next(c for c in abiertos if c['id'] == i)['alerta']['senal']}")
+        caso = next(c for c in abiertos if c["id"] == id_sel)
         ref = f' <span style="color:#6b7280;font-size:.85rem">{caso["plazo_ref"]}</span>' if caso.get("plazo_ref") else ""
         st.markdown(f'<div class="decision" style="padding:12px 16px"><div class="m"><b>Qué hacer:</b> {caso.get("accion", caso["alerta"]["decision"])}<br>'
                     f'<b>Prioridad:</b> {caso["prioridad"]} · <b>Responsable:</b> {caso["responsable"]}<br>'
@@ -3367,6 +3446,9 @@ def pagina_ejecucion():
         if caso["origen"] == "sensor":
             st.radio("Efecto simulado de la intervención (selector de prueba)", EFECTOS, key="w_ej_efecto", horizontal=True,
                      help="Este caso viene de sensores: define cómo se comportan las 12 lecturas posteriores (efectiva, parcial o no efectiva).")
+        elif caso["origen"] == "plan":
+            st.caption("Este caso viene del plan: se verifica con una nueva medición de la tarea. Regístrala en la sección «Checklist del plan» y "
+                       "luego pulsa Verificar.")
         else:
             st.caption("Se compara con los datos del periodo siguiente a la alerta, según la Tabla 7. No hace falta simular nada.")
         st.button("Verificar resultante", key="b_verificar", type="primary", width="stretch", on_click=cb_verificar)
@@ -3397,6 +3479,8 @@ def pagina_ejecucion():
                        unsafe_allow_html=True)
             if res["ok"]:
                 st.markdown('<div class="resultado ok">CERRADO ✓</div>', unsafe_allow_html=True)
+            elif res.get("mantiene"):
+                st.markdown('<div class="resultado bad">SIGUE ABIERTO ✗</div>', unsafe_allow_html=True)
             else:
                 st.markdown('<div class="resultado bad">REABIERTO ✗</div>', unsafe_allow_html=True)
             _grafico_antes_despues(res)
@@ -3404,10 +3488,9 @@ def pagina_ejecucion():
                 st.markdown("**Qué cambió en el sistema:**" if res["ok"] else "**Qué pasa ahora:**")
                 for ln in r["lineas"]:
                     st.write("• " + ln)
-            if not res["ok"]:
+            if not res["ok"] and not res.get("mantiene"):
                 st.button("Volver al paso 5 con este caso ›", key="b_reabrir", type="primary", width="stretch",
                           on_click=cb_reabrir, args=(caso["id"],))
-    pie_siguiente("ejecucion")
 
 
 
@@ -3710,7 +3793,7 @@ def _val_resultados():
         if causa != "Todas":
             d = d[d.Causa_DSS == causa]
         st.caption("Detalle de la iteración 1 (días remuestreados) del escenario elegido: parada y producción antes y después del efecto del DSS.")
-        mostrar = d.drop(columns=["scen", "mes"]).copy()
+        mostrar = d.drop(columns=["scen", "mes", "Estacion_ID", "Tiempo_Planificado_h", "Capacidad_Nominal_bidones_h"]).copy()
         mostrar["Fecha"] = pd.to_datetime(mostrar["Fecha"]).dt.strftime("%Y-%m-%d")
         for c in ("Parada_DSS_h", "Operativo_DSS_h"):
             mostrar[c] = mostrar[c].round(2)
@@ -3860,6 +3943,16 @@ def construir_excel_total():
     datos["Fecha"] = datos["Fecha"].dt.strftime("%Y-%m-%d")
     hojas = [("KPIs y metas", df_kpis_metas(df)), ("Datos activos", info), ("Tabla 1", t1), ("Alertas", df_alertas(df)), ("Casos", df_casos()),
              ("Matriz de criticidad", _matriz_df()), ("AMEF", df_amef()), ("Parámetros", df_parametros()), ("Datos", datos)]
+    tareas = tareas_plan()
+    reg = pd.DataFrame([dict(Fecha=r["fecha"].strftime("%Y-%m-%d"), Tarea=r["id"], Estación=EST_NOM[r["est"]], Valor_medido=r["valor"],
+                             Cumple="Sí" if r["cumple"] else "No", Acción_realizada=r["accion"], Rol=r["rol"], Caso=r["caso"] or "sin caso")
+                        for r in s.get("registro_plan", [])])
+    hojas.insert(5, ("Plan de mantenimiento", plan_df(tareas)))
+    hojas.insert(6, ("Registro del plan", reg))
+    comp = df_comparativo_export()
+    if comp is not None:
+        hojas += [("Comparativo", comp["indicadores"]), ("Comparativo por estación", comp["estaciones"]),
+                  ("Pareto antes y después", comp["pareto"]), ("Datos antes y después", comp["info"])]
     if s.get("v_res") is not None:
         fr = frames_mc(s.v_res, df)
         hojas += [("MC Resumen", fr["resumen"]), ("MC Estaciones", fr["estaciones"]), ("MC Mensual", fr["mensual"]), ("MC Iteraciones", fr["iteraciones"])]
@@ -3880,7 +3973,8 @@ def pagina_export():
                  "Descarga todo lo que hiciste en un solo Excel: KPIs, datos, tablas, alertas, casos, matriz, AMEF, parámetros y, si corriste la "
                  "validación, sus resultados. También hay CSV sueltos.")
     firma = (s.datos["archivo"], len(s.casos), tuple(c["estado"] for c in s.casos), str(s.matriz), str(s.amef_ov), str(s.d_ajustes),
-             str(s.metas), id(s.get("v_res")), str(sorted(s.umb.items())))
+             str(s.metas), id(s.get("v_res")), str(sorted(s.umb.items())), len(s.get("registro_plan", [])), str(s.get("plan_ov")),
+             str(s.get("plan_frec")), (s.get("despues") or {}).get("archivo"), len(s.casos))
     if s.get("xlsx_total_firma") != firma:
         s.xlsx_total = construir_excel_total()
         s.xlsx_total_firma = firma
@@ -3889,7 +3983,7 @@ def pagina_export():
                        width="stretch", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.markdown("**Hojas incluidas:** " + " · ".join(hojas))
     if s.get("v_res") is None:
-        st.caption("Las hojas «MC …» aparecen cuando ejecutas la validación (paso 7).")
+        st.caption("Las hojas «MC …» aparecen cuando ejecutas la validación (paso 10).")
     st.markdown("**CSV sueltos**")
     df = df_activo()
     a, b = st.columns(2)
@@ -3904,8 +3998,772 @@ def pagina_export():
 # =============================================================================
 # PRINCIPAL
 # =============================================================================
+# =============================================================================
+# PASO 6 - PLAN DE MANTENIMIENTO
+# =============================================================================
+FREC_OPCIONES = ["Cada turno", "Diario", "Semanal", "Quincenal", "Mensual", "Trimestral"]
+FREC_DEF = {"Crítica": ("Cada turno", "Semanal"), "Alta": ("Cada turno", "Semanal"),
+            "Media": ("Diario", "Quincenal"), "Baja": ("Semanal", "Mensual")}
+EJEMPLO = "(ejemplo, ajustar con la empresa)"
+EST_PLAN = {0: "General", 1: "E1", 2: "E2", 3: "E3"}
+EST_PLAN_LARGO = {0: "General: todas las estaciones", 1: EST_NOM[1], 2: EST_NOM[2], 3: EST_NOM[3]}
+
+
+def _t(id_, est, equipo, que, como, unidad, lo, hi, tipo, link, crit, si_no, minutos):
+    return dict(id=id_, est=est, equipo=equipo, que=que, como=como, unidad=unidad, lo=lo, hi=hi, tipo=tipo, link=link,
+                crit=crit, si_no=si_no, minutos=minutos)
+
+
+PLAN_DEF = [
+    # --- E1 lavado y sanitizado ---
+    _t("T-E1-01", 1, "Lavadora de bidones (bomba)", "Presión de las boquillas de lavado",
+       "Leer el manómetro de la línea de lavado con la máquina en marcha", "bar", 2.0, 3.5, "autonomo",
+       ("Bomba", "presion", "baja", "Desgaste del impulsor"), None, "Limpiar las boquillas, avisar a Mantenimiento y abrir un caso", 5),
+    _t("T-E1-02", 1, "Lavadora de bidones", "Temperatura del sanitizante", "Leer el termómetro del tanque de sanitizante", "°C",
+       55, 65, "autonomo", None, "Alta", "Detener el lavado, corregir la temperatura y avisar a Mantenimiento", 3),
+    _t("T-E1-03", 1, "Lavadora de bidones", "Concentración del sanitizante", "Medir con tira reactiva en una muestra del tanque", "ppm",
+       150, 250, "autonomo", None, "Alta", "Corregir la dosificación antes de seguir lavando y avisar a Calidad", 4),
+    _t("T-E1-04", 1, "Tanque de sanitizante", "Nivel de químico", "Leer el visor del tanque", "%", 45, 90, "autonomo",
+       ("Tanque", "nivel", "baja", "Obstrucción o falla de la válvula de alimentación"), None,
+       "Reponer el químico y revisar la válvula de alimentación", 2),
+    _t("T-E1-05", 1, "Lavadora de bidones (filtros)", "Estado de los filtros", "Restar la presión de salida a la de entrada del filtro", "bar",
+       None, 0.5, "autonomo", ("Bomba", "caudal", "baja", "Filtro de línea obstruido"), None, "Limpiar o cambiar el filtro", 6),
+    _t("T-E1-06", 1, "Bomba de lavado", "Vibración de la bomba", "Medir con el sensor de vibración ifm VVB001 en el cuerpo de la bomba",
+       "mm/s", None, 4.5, "planificado", ("Bomba", "vibracion", "alta", "Desgaste de rodamiento"), None,
+       "Cambiar el rodamiento y abrir un caso", 10),
+    _t("T-E1-07", 1, "Bomba de lavado", "Corriente del motor", "Medir con pinza amperimétrica con la bomba en marcha", "A", None, 7.5,
+       "planificado", ("Bomba", "corriente", "alta", "Desgaste de rodamiento"), None, "Revisar rodamientos y alineación, y abrir un caso", 8),
+    # --- E2 llenado y tapado ---
+    _t("T-E2-01", 2, "Llenadora-tapadora (válvula dosificadora)", "Goteo de la válvula dosificadora",
+       "Contar las gotas en 1 minuto con la válvula cerrada", "gotas/min", None, 2, "autonomo",
+       ("Llenadora", "ciclo", "alta", "Desgaste de válvula dosificadora"), None, "Cambiar el empaque de la válvula y abrir un caso", 5),
+    _t("T-E2-02", 2, "Llenadora-tapadora (tapadora)", "Torque de tapado", "Medir 5 tapas con el torquímetro Mark-10 TT01 y promediar",
+       "N·cm", 10, 15, "planificado", ("Tapadora", "torque", "baja", "Desgaste del embrague del cabezal"), None,
+       "Ajustar el embrague del cabezal; si persiste, cambiarlo y abrir un caso", 15),
+    _t("T-E2-03", 2, "Llenadora-tapadora (aire comprimido)", "Presión de aire comprimido", "Leer el manómetro del regulador de aire", "bar",
+       5.5, None, "autonomo", ("Llenadora", "ciclo", "alta", "Aire comprimido insuficiente en actuadores"), None,
+       "Revisar el compresor y las mangueras, y abrir un caso", 3),
+    _t("T-E2-04", 2, "Llenadora-tapadora (boquillas)", "Limpieza de boquillas", "Contar cuántas de 10 boquillas están obstruidas o con residuos",
+       "boquillas", None, 0, "autonomo", ("Llenadora", "presion_alim", "baja", "Filtro de alimentación obstruido"), None,
+       "Desarmar y limpiar las boquillas obstruidas", 10),
+    _t("T-E2-05", 2, "Llenadora-tapadora (dosificación)", "Calibración del volumen de llenado",
+       "Pesar 5 llenados y calcular el error promedio de volumen", "%", None, 1.0, "planificado",
+       ("Llenadora", "rech_llen", "alta", "Medición de dosificación descalibrada"), None, "Recalibrar la dosificación y abrir un caso", 20),
+    _t("T-E2-06", 2, "Llenadora-tapadora (alimentación)", "Presión de alimentación del producto", "Leer el sensor ifm PM1105 de la línea de alimentación",
+       "bar", 1.5, 3.0, "planificado", ("Llenadora", "presion_alim", "baja", "Bomba de alimentación degradada"), None,
+       "Revisar la bomba de alimentación y abrir un caso", 10),
+    # --- E3 sellado y etiquetado ---
+    _t("T-E3-01", 3, "Selladora", "Temperatura de sellado", "Leer el termómetro de la mordaza de sellado", "°C", 150, 180, "autonomo",
+       ("Selladora", "rech_sello", "alta", "Desgaste del empaque o sello de tapa"), None,
+       "Ajustar la temperatura; si el sello sigue débil, cambiar el empaque y abrir un caso", 4),
+    _t("T-E3-02", 3, "Selladora", "Rechazos de sello", "Contar los sellos defectuosos en 50 envases", "sellos/50", None, 1, "autonomo",
+       ("Selladora", "rech_sello", "alta", "Tapas o envases con defecto dimensional"), None,
+       "Separar el lote, revisar tapas y envases, y abrir un caso", 6),
+    _t("T-E3-03", 3, "Etiquetadora", "Alineación de la etiqueta", "Medir con plantilla la desviación en 5 envases", "mm", None, 2, "autonomo",
+       ("Etiquetadora", "cal_etiq", "NG", "Desalineación del aplicador"), None, "Realinear el aplicador y abrir un caso", 5),
+    _t("T-E3-04", 3, "Etiquetadora", "Paros por atasco de etiquetas", "Contar los paros por atasco durante el turno", "paros/turno", None, 2,
+       "autonomo", ("Etiquetadora", "estado", "STOP", "Atasco de etiquetas o rollo agotado"), None,
+       "Revisar el recorrido de la etiqueta y el rollo", 3),
+    _t("T-E3-05", 3, "Etiquetadora", "Desgaste de rodillos", "Medir con calibrador el desgaste del rodillo", "mm", None, 1.0, "planificado",
+       ("Etiquetadora", "estado", "STOP", "Falla del servomotor o del sensor de etiquetas"), None, "Cambiar los rodillos y abrir un caso", 15),
+    # --- generales de seguridad e inspección básica ---
+    _t("T-G-01", 0, "Todas las máquinas", "Cables y enchufes sin daño", "Revisión visual de cables, enchufes y tomas; contar los hallazgos",
+       "hallazgos", 0, 0, "autonomo", None, "Alta", "Desconectar la máquina, no usarla y avisar a Mantenimiento", 3),
+    _t("T-G-02", 0, "Todas las máquinas", "Distancia mínima de la máquina a la pared (ventilación y acceso)",
+       "Medir con cinta métrica el punto más cercano", "cm", 50, None, "autonomo", None, "Media",
+       "Reubicar la máquina o retirar lo que estorba", 3),
+    _t("T-G-03", 0, "Todas las máquinas", "Fugas de agua, aire o aceite", "Recorrer la máquina y contar los puntos con fuga", "puntos", 0, 0,
+       "autonomo", None, "Media", "Cerrar la fuga o ajustar la conexión y avisar a Mantenimiento", 4),
+    _t("T-G-04", 0, "Todas las máquinas", "Ruidos o vibración anormal", "Escuchar y tocar la máquina en marcha; contar los hallazgos",
+       "hallazgos", 0, 0, "autonomo", None, "Media", "Parar la máquina y avisar a Mantenimiento", 3),
+    _t("T-G-05", 0, "Todas las máquinas", "Limpieza del área", "Contar los puntos con residuos o charcos alrededor", "puntos", 0, 0,
+       "autonomo", None, "Baja", "Limpiar el área antes de seguir", 5),
+    _t("T-G-06", 0, "Tablero eléctrico", "Bornes y conexiones", "Revisar con la máquina desenergizada y contar los bornes flojos", "bornes",
+       0, 0, "planificado", None, "Alta", "Apretar los bornes y registrar; si hay daño, cambiar el componente", 20),
+    _t("T-G-07", 0, "Todas las máquinas", "Guardas de seguridad", "Contar las guardas faltantes o sueltas", "guardas", 0, 0, "planificado",
+       None, "Alta", "Reponer o fijar la guarda antes de operar", 10),
+]
+
+
+def _lim(x):
+    return g_(x)
+
+
+def criterio_txt(t):
+    lo, hi, u = t["lo"], t["hi"], t["unidad"]
+    if lo is not None and hi is not None:
+        base = f"= {_lim(lo)} {u}" if lo == hi else f"{_lim(lo)} a {_lim(hi)} {u}"
+    elif hi is not None:
+        base = f"≤ {_lim(hi)} {u}"
+    elif lo is not None:
+        base = f"≥ {_lim(lo)} {u}"
+    else:
+        base = "sin criterio definido"
+    return f"{base} {EJEMPLO}"
+
+
+def cumple_tarea(t, valor):
+    return (t["lo"] is None or valor >= t["lo"] - 1e-9) and (t["hi"] is None or valor <= t["hi"] + 1e-9)
+
+
+def prio_tarea(t):
+    """Criticidad de la tarea: sale de la matriz si está ligada a una causa del AMEF; si no, es fija (ejemplo)."""
+    s = st.session_state
+    if t["link"]:
+        eq, vkey, direc, causa = t["link"]
+        for c in causas_vigentes(eq, vkey, direc, s.get("d_ajustes", {})):
+            if c["causa"] == causa:
+                return evaluar_c3(c)["prioridad"]
+    return t["crit"] or "Media"
+
+
+def tareas_plan():
+    s = st.session_state
+    ov, frec = s.get("plan_ov", {}), s.get("plan_frec", {})
+    salida = []
+    for base in PLAN_DEF:
+        t = dict(base)
+        o = ov.get(t["id"], {})
+        if "lo" in o:
+            t["lo"] = o["lo"]
+        if "hi" in o:
+            t["hi"] = o["hi"]
+        if "min" in o:
+            t["minutos"] = o["min"]
+        t["prio"] = prio_tarea(t)
+        par = frec.get(t["prio"], FREC_DEF[t["prio"]])
+        t["frec"] = par[0] if t["tipo"] == "autonomo" else par[1]
+        t["rol"] = (f"Operador de {EST_PLAN[t['est']]}" if t["est"] else "Operador del turno") if t["tipo"] == "autonomo" \
+            else "Técnico de Mantenimiento"
+        t["criterio"] = criterio_txt(t)
+        salida.append(t)
+    return salida
+
+
+def casos_activos():
+    return [c for c in st.session_state.casos if c["estado"] in ("Abierto", "Reabierto")]
+
+
+def tarea_de_caso(caso, tareas):
+    pid = caso["alerta"].get("plan_id")
+    if pid:
+        return next((t for t in tareas if t["id"] == pid), None)
+    ident = caso["causa"].get("ident")
+    if ident:
+        return next((t for t in tareas if t["link"] == tuple(ident)), None)
+    return None
+
+
+def plan_df(tareas):
+    filas = []
+    for t in tareas:
+        filas.append({"ID": t["id"], "Tipo": "Autónomo (operario)" if t["tipo"] == "autonomo" else "Planificado (técnico)",
+                      "Estación": EST_PLAN[t["est"]], "Equipo": t["equipo"], "Qué revisar": t["que"], "Cómo se mide": t["como"],
+                      "Criterio de aceptación": t["criterio"], "Frecuencia": t["frec"], "Responsable": t["rol"],
+                      "Qué hacer si no cumple": t["si_no"], "Tiempo estimado (min)": t["minutos"], "Criticidad": t["prio"]})
+    return pd.DataFrame(filas)
+
+
+def plan_xlsx(tareas):
+    base = plan_df(tareas)
+    buf = io.BytesIO()
+    vacias = ["Valor medido", "Cumple (sí/no)", "Fecha", "Acción realizada", "Firma del responsable"]
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for nombre, tipo in (("Autónomo (operario)", "Autónomo (operario)"), ("Planificado (técnico)", "Planificado (técnico)")):
+            d = base[base["Tipo"] == tipo].drop(columns=["Tipo"]).copy()
+            for c in vacias:
+                d[c] = ""
+            d.to_excel(xw, sheet_name=nombre, index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                ancho = max(len(str(c.value)) if c.value is not None else 0 for c in col[:60])
+                ws.column_dimensions[col[0].column_letter].width = min(max(12, ancho + 2), 48)
+            ws.freeze_panes = "A2"
+    return buf.getvalue()
+
+
+def _fila_plan(t, marca):
+    return [marca + EST_PLAN[t["est"]], t["equipo"], t["que"], t["como"], t["criterio"], t["frec"], t["rol"], t["si_no"], f"{t['minutos']} min"]
+
+
+def tabla_plan(tareas, tipo, tareas_caso):
+    col = NPR_COL["ambar"]
+    for est in (1, 2, 3, 0):
+        sub = [t for t in tareas if t["tipo"] == tipo and t["est"] == est]
+        if not sub:
+            continue
+        sub.sort(key=lambda t: (t["id"] not in tareas_caso, t["id"]))
+        st.markdown(f"##### {EST_PLAN_LARGO[est]}")
+        filas = []
+        for t in sub:
+            marca = ""
+            if t["id"] in tareas_caso:
+                marca = (f'<span class="npr" style="background:{col[0]};color:{col[1]}">★ {tareas_caso[t["id"]]}</span><br>')
+            filas.append(_fila_plan(t, marca))
+        tabla_html(["Estación", "Equipo", "Qué revisar", "Cómo se mide", "Criterio de aceptación", "Frecuencia", "Responsable",
+                    "Qué hacer si no cumple", "Tiempo estimado"], filas, desplazable=True)
+
+
+def pagina_plan():
+    abrir_pagina("plan", "Plan de mantenimiento",
+                 "Aquí ves qué revisar, cómo medirlo, cada cuánto y qué hacer si no cumple. El operario hace las tareas de mantenimiento autónomo "
+                 "y el técnico las de mantenimiento planificado. La frecuencia depende de la criticidad. Si hay un caso abierto, su tarea "
+                 "correctiva aparece primero.")
+    tareas = tareas_plan()
+    a, b = st.columns(2)
+    a.download_button("Descargar checklist (Excel)", plan_xlsx(tareas), file_name="plan_de_mantenimiento.xlsx", key="dl_plan_xlsx",
+                      type="primary", width="stretch", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                      help="Checklist imprimible para el operario, con columnas en blanco para anotar.")
+    b.download_button("Descargar checklist (CSV)", plan_df(tareas).to_csv(index=False).encode("utf-8-sig"),
+                      file_name="plan_de_mantenimiento.csv", mime="text/csv", key="dl_plan_csv", width="stretch")
+    activos = casos_activos()
+    tareas_caso = {}
+    for c in activos:
+        t = tarea_de_caso(c, tareas)
+        if t is not None:
+            tareas_caso.setdefault(t["id"], c["id"])
+        a_ = c["alerta"]
+        ref = f' <span style="color:#6b7280;font-size:.85rem">{c["plazo_ref"]}</span>' if c.get("plazo_ref") else ""
+        cab = (f'★ Caso {c["id"]}: {EST_NOM[a_["est"]]}, {c["causa"]["causa"]}'
+               + (f' (NPR {c["causa"]["npr"]})' if c["causa"].get("npr") else "") + f', prioridad {c["prioridad"]}')
+        if t is not None:
+            cuerpo = (f'<b>Tarea correctiva del plan:</b> {t["que"]} ({t["id"]})<br><b>Cómo se mide:</b> {t["como"]}<br>'
+                      f'<b>Criterio de aceptación:</b> {t["criterio"]}<br><b>Si no cumple:</b> {t["si_no"]}<br>'
+                      f'<b>Responsable:</b> {t["rol"]} · <b>Tiempo estimado:</b> {t["minutos"]} min<br>')
+        else:
+            cuerpo = f'<b>Tarea correctiva:</b> {c.get("accion", a_["decision"])}<br><b>Responsable:</b> {c["responsable"]}<br>'
+        st.markdown(f'<div class="decision"><div class="t">{cab}</div><div class="m">{cuerpo}<b>Plazo:</b> {c["plazo"]}{ref}</div></div>',
+                    unsafe_allow_html=True)
+    if not activos:
+        st.caption("No hay casos abiertos: se muestra el plan estándar. Los casos se crean en el paso 5 o cuando una medición no cumple.")
+    tabs = st.tabs(["Mantenimiento autónomo (operario)", "Mantenimiento planificado (técnico)"])
+    with tabs[0]:
+        tabla_plan(tareas, "autonomo", tareas_caso)
+    with tabs[1]:
+        tabla_plan(tareas, "planificado", tareas_caso)
+    st.caption(f"Las frecuencias y los criterios se editan en el paso 3, pestaña «Plan de mantenimiento». Todos los criterios son {EJEMPLO}.")
+    pie_siguiente("plan")
+
+
+# =============================================================================
+# PASO 7 - CHECKLIST DEL PLAN (ejecución)
+# =============================================================================
+def caso_desde_tarea(t, valor, fecha, accion, est):
+    """Crea el caso de una medición fuera del criterio, o actualiza el que ya está abierto para esa tarea."""
+    s = st.session_state
+    existente = next((c for c in casos_activos() if c["alerta"]["est"] == est and
+                      ((t["link"] and c["causa"].get("ident") == t["link"]) or c["alerta"].get("plan_id") == t["id"])), None)
+    medicion = dict(fecha=pd.Timestamp(fecha), valor=valor, accion=accion, ts=pd.Timestamp.now())
+    if existente is not None:
+        existente.setdefault("mediciones", []).append(medicion)
+        existente["alerta"]["valor"] = f"{g_(valor)} {t['unidad']}"
+        existente["alerta"]["valor_num"] = valor
+        return existente, False
+    t7 = T7["plan"]
+    al = dict(id=f"P|{t['id']}|E{est}|{pd.Timestamp(fecha):%Y%m%d}", tipo="plan", fecha=pd.Timestamp(fecha), est=est, causa_parada="",
+              senal=f"Plan de mantenimiento fuera del criterio: {t['equipo']}, {t['que']}", valor=f"{g_(valor)} {t['unidad']}",
+              umbral=t["criterio"], valor_num=valor, umbral_num=t["hi"] if t["hi"] is not None else t["lo"], gravedad=1.0, color="naranja",
+              decision=t7["decision"], resp=t7["resp"], plazo=t7["plazo"], roles=t7["roles"],
+              cierre="Nueva medición dentro del criterio en el checklist", plan_id=t["id"])
+    if t["link"]:
+        eq, vkey, direc, causa_nom = t["link"]
+        causa = next(c for c in causas_vigentes(eq, vkey, direc, s.d_ajustes) if c["causa"] == causa_nom)
+        v = next(x for x in VARIABLES[eq] if x["key"] == vkey)
+        causa.update(equipo=eq, vkey=vkey, vnombre=v["nombre"], direccion=direc, ident=t["link"], descartada=False)
+        al["sensor_ref"] = (eq, vkey, direc)
+        c3 = evaluar_c3(causa)
+    else:
+        causa = dict(causa=t["que"], efecto="Medición fuera del criterio del plan", S=0, O=0, D=0, npr=0, equipo=t["equipo"], vkey="plan",
+                     vnombre=t["que"], direccion="n/d", ident=None, ejemplo=True, ajustada=False, descartada=False)
+        c3 = dict(prioridad=t["prio"], tipo="Autónomo" if t["tipo"] == "autonomo" else "Planificado",
+                  regla=f"Criticidad fija de la tarea {EJEMPLO}")
+    caso = nuevo_caso(al, causa, c3, origen="plan")
+    caso["accion"] = f"{t['si_no']} (tarea {t['id']})"
+    caso["plan_id"] = t["id"]
+    caso["mediciones"] = [medicion]
+    s.casos.append(caso)
+    return caso, True
+
+
+def cb_registrar_medicion():
+    s = st.session_state
+    t = next((x for x in tareas_plan() if x["id"] == s.get("w_chk_tarea")), None)
+    if t is None:
+        return
+    valor = float(s.get("w_chk_valor", 0.0))
+    fecha = s.get("w_chk_fecha")
+    accion = str(s.get("w_chk_accion", "")).strip() or "Sin acción registrada"
+    est = t["est"] or {"E1": 1, "E2": 2, "E3": 3}.get(s.get("w_chk_est", "E1"), 1)
+    cumple = cumple_tarea(t, valor)
+    reg = dict(id=t["id"], fecha=pd.Timestamp(fecha), valor=valor, cumple=cumple, accion=accion, est=est, rol=t["rol"],
+               ts=pd.Timestamp.now(), caso=None)
+    if cumple:
+        s.msg_chk = ("ok", f"Medición registrada: {t['que']} cumple el criterio.")
+        st.toast("Medición registrada: cumple", icon="✅")
+    else:
+        caso, nuevo = caso_desde_tarea(t, valor, fecha, accion, est)
+        reg["caso"] = caso["id"]
+        verbo = "creado" if nuevo else "actualizado"
+        s.msg_chk = ("warn", f"No cumple el criterio. Caso {caso['id']} {verbo}: {EST_NOM[caso['alerta']['est']]}, {caso['causa']['causa']}, "
+                             f"prioridad {caso['prioridad']}.")
+        st.toast(f"Caso {caso['id']} {verbo}", icon="⚠️")
+    s.registro_plan.append(reg)
+    s.w_chk_accion = ""
+
+
+def verificar_plan(caso):
+    """Verifica un caso del plan con la siguiente medición registrada en el checklist."""
+    s = st.session_state
+    al = caso["alerta"]
+    t = next(x for x in tareas_plan() if x["id"] == al["plan_id"])
+    meds = caso.get("mediciones", [])
+    # la medición de referencia es la que abrió el caso; tras una verificación, la referencia es la hora de esa verificación
+    ts_base = caso["intervenciones"][-1]["ts"] if caso["intervenciones"] and caso["intervenciones"][-1].get("ts") is not None \
+        else (meds[0]["ts"] if meds else caso["creado"])
+    registro = [r for r in s.get("registro_plan", []) if r["id"] == t["id"]]
+    nuevas = [r for r in registro if r["ts"] > ts_base]
+    if not nuevas:
+        return dict(sin_datos=True, ok=None, mensaje="No hay una nueva medición de esta tarea. Regístrala en la sección «Checklist del plan» y "
+                                                     "vuelve a verificar.")
+    r = nuevas[-1]
+    previas = [x for x in registro if x["ts"] <= ts_base]
+    antes = previas[-1]["valor"] if previas else (meds[0]["valor"] if meds else al.get("valor_num", float("nan")))
+    lim = t["hi"] if t["hi"] is not None else t["lo"]
+    return dict(sin_datos=False, ok=bool(r["cumple"]), tipo_u="num", antes=float(antes), despues=float(r["valor"]),
+                esperado=float(lim) if lim is not None else None, cond="≤" if t["hi"] is not None else "≥",
+                etiqueta_antes="Antes (medición fuera del criterio)", etiqueta_despues="Después (nueva medición)",
+                esperado_txt=f"{t['que']}: {t['criterio']}", observado_txt=f"{g_(r['valor'])} {t['unidad']} el {r['fecha']:%d/%m/%Y}",
+                ventana="nueva medición del checklist", n_obs=1, unidad=t["unidad"],
+                rango=(t["lo"], t["hi"]) if (t["lo"] is not None and t["hi"] is not None) else None)
+
+
+def checklist_plan():
+    s = st.session_state
+    tareas = tareas_plan()
+    msg = s.pop("msg_chk", None)
+    if msg:
+        caja(msg[1], msg[0])
+    activos = casos_activos()
+    prioritarias = {tarea_de_caso(c, tareas)["id"] for c in activos if tarea_de_caso(c, tareas) is not None}
+    orden = sorted(tareas, key=lambda t: (t["id"] not in prioritarias, t["est"] == 0, t["est"], t["tipo"], t["id"]))
+    por_id = {t["id"]: t for t in orden}
+    ids = list(por_id)
+    if s.get("w_chk_tarea") not in ids:
+        s.w_chk_tarea = ids[0]
+    st.markdown("##### Registrar una medición")
+    tid = st.selectbox("Tarea del checklist", ids, key="w_chk_tarea",
+                       format_func=lambda i: f"{'★ ' if i in prioritarias else ''}{i} · {EST_PLAN[por_id[i]['est']]} · {por_id[i]['que']} "
+                                             f"({'autónomo' if por_id[i]['tipo'] == 'autonomo' else 'planificado'}, {por_id[i]['frec'].lower()})")
+    t = por_id[tid]
+    st.markdown(f'<div class="mini-p"><b>Cómo se mide:</b> {t["como"]}<br><b>Criterio de aceptación:</b> {t["criterio"]}<br>'
+                f'<b>Responsable:</b> {t["rol"]} · <b>Tiempo estimado:</b> {t["minutos"]} min</div>', unsafe_allow_html=True)
+    a, b, c = st.columns(3)
+    a.number_input(f"Valor medido ({t['unidad']})", step=0.1, format="%.2f", key="w_chk_valor")
+    b.date_input("Fecha", key="w_chk_fecha")
+    if t["est"] == 0:
+        c.selectbox("Estación donde se midió", ["E1", "E2", "E3"], key="w_chk_est")
+    else:
+        c.markdown(f'<div class="mini-p" style="padding-top:1.9rem"><b>Estación:</b> {EST_PLAN_LARGO[t["est"]]}</div>', unsafe_allow_html=True)
+    st.text_input("Acción realizada", key="w_chk_accion", placeholder="Ej.: se cambió el empaque de la válvula")
+    cumple = cumple_tarea(t, float(s.get("w_chk_valor", 0.0)))
+    st.markdown(f'Con este valor: <b style="color:{VERDE if cumple else ROJO}">{"✓ Cumple el criterio" if cumple else "✗ No cumple el criterio"}</b>'
+                + ("" if cumple else " (al registrarla se crea o actualiza un caso)"), unsafe_allow_html=True)
+    st.button("Registrar medición", key="b_chk_reg", type="primary", width="stretch", on_click=cb_registrar_medicion)
+    st.markdown("##### Registro de mediciones")
+    reg = s.get("registro_plan", [])
+    if not reg:
+        st.caption("Todavía no hay mediciones registradas.")
+        return
+    cumplen = sum(1 for r in reg if r["cumple"])
+    k = st.columns(3)
+    kpi(k[0], "Mediciones", n(len(reg), 0), "registradas")
+    kpi(k[1], "Cumplen", n(cumplen, 0), "dentro del criterio", "ok")
+    kpi(k[2], "No cumplen", n(len(reg) - cumplen, 0), "generan o actualizan un caso", "bad" if len(reg) - cumplen else None)
+    st.write("")
+    por = {t_["id"]: t_ for t_ in tareas}
+    filas = []
+    for r in reversed(reg[-30:]):
+        t_ = por[r["id"]]
+        res = f'<b style="color:{VERDE if r["cumple"] else ROJO}">{"Cumple" if r["cumple"] else "No cumple"}</b>'
+        filas.append([f"{r['fecha']:%d/%m/%Y}", r["id"], t_["que"], f"{g_(r['valor'])} {t_['unidad']}", t_["criterio"], res, r["accion"],
+                      r["caso"] or "sin caso"])
+    tabla_html(["Fecha", "Tarea", "Qué se revisó", "Valor medido", "Criterio", "Resultado", "Acción realizada", "Caso"], filas, desplazable=True)
+
+
+# ---------------------------------------------------------------- parámetros del plan
+def _tab_plan():
+    s = st.session_state
+    explica("El plan reparte las tareas entre el operario (mantenimiento autónomo) y el técnico (mantenimiento planificado). Cada cuánto se hace "
+            f"cada tarea depende de su criticidad en la matriz. Los criterios de aceptación no salen de los datos: son {EJEMPLO} y puedes cambiarlos.")
+    st.markdown(f"**Frecuencia según la criticidad** {EJEMPLO}")
+    src = pd.DataFrame([{"Criticidad": p, "Mantenimiento autónomo (operario)": s.plan_frec.get(p, FREC_DEF[p])[0],
+                         "Mantenimiento planificado (técnico)": s.plan_frec.get(p, FREC_DEF[p])[1]} for p in ("Crítica", "Alta", "Media", "Baja")])
+    ed = st.data_editor(src, hide_index=True, width="stretch", key="w_ed_planfrec", disabled=["Criticidad"],
+                        column_config={c: st.column_config.SelectboxColumn(c, options=FREC_OPCIONES, required=True)
+                                       for c in ("Mantenimiento autónomo (operario)", "Mantenimiento planificado (técnico)")})
+    s.plan_frec = {r["Criticidad"]: (r["Mantenimiento autónomo (operario)"], r["Mantenimiento planificado (técnico)"]) for _, r in ed.iterrows()}
+    st.markdown(f"**Criterios de aceptación y tiempos** {EJEMPLO}")
+    ov = s.plan_ov
+    filas = []
+    for t in PLAN_DEF:
+        o = ov.get(t["id"], {})
+        filas.append({"ID": t["id"], "Estación": EST_PLAN[t["est"]], "Qué revisar": t["que"], "Unidad": t["unidad"],
+                      "Mínimo": o.get("lo", t["lo"]) if o.get("lo", t["lo"]) is not None else np.nan,
+                      "Máximo": o.get("hi", t["hi"]) if o.get("hi", t["hi"]) is not None else np.nan,
+                      "Tiempo estimado (min)": o.get("min", t["minutos"])})
+    ed2 = st.data_editor(pd.DataFrame(filas), hide_index=True, width="stretch", key="w_ed_planov", height=420,
+                         disabled=["ID", "Estación", "Qué revisar", "Unidad"],
+                         column_config={"Mínimo": st.column_config.NumberColumn(format="%.2f", help="Vacío significa sin mínimo."),
+                                        "Máximo": st.column_config.NumberColumn(format="%.2f", help="Vacío significa sin máximo."),
+                                        "Tiempo estimado (min)": st.column_config.NumberColumn(min_value=1, step=1)})
+    nuevo = {}
+    for (_, r), t in zip(ed2.iterrows(), PLAN_DEF):
+        lo = None if pd.isna(r["Mínimo"]) else float(r["Mínimo"])
+        hi = None if pd.isna(r["Máximo"]) else float(r["Máximo"])
+        mn = int(r["Tiempo estimado (min)"]) if pd.notna(r["Tiempo estimado (min)"]) else t["minutos"]
+        d = {}
+        if lo != (None if t["lo"] is None else float(t["lo"])):
+            d["lo"] = lo
+        if hi != (None if t["hi"] is None else float(t["hi"])):
+            d["hi"] = hi
+        if mn != t["minutos"]:
+            d["min"] = mn
+        if d:
+            nuevo[t["id"]] = d
+    s.plan_ov = nuevo
+    st.button("Restablecer valores de la tesis", key="b_reset_plan", on_click=_reset_plan,
+              help="Vuelve a las frecuencias y criterios de ejemplo del plan.")
+
+
+def _reset_plan():
+    s = st.session_state
+    s.plan_ov = {}
+    s.plan_frec = {k: v for k, v in FREC_DEF.items()}
+    s.pop("w_ed_planfrec", None)
+    s.pop("w_ed_planov", None)
+
+
+# =============================================================================
+# PASO 8 - RESULTADOS MEJORADOS (DESPUES)
+# =============================================================================
+def df_desde_detalle(det, fechas):
+    """Convierte una iteración simulada (DSS completo) en una base con el mismo formato que OEE_Diario."""
+    n_filas = len(fechas) * 3
+    d = det.iloc[:n_filas].reset_index(drop=True)
+    out = pd.DataFrame(dict(
+        Fecha=np.repeat(pd.DatetimeIndex(fechas).to_numpy(), 3), Estacion_ID=d["Estacion_ID"].astype(int).to_numpy(),
+        Tiempo_Planificado_h=d["Tiempo_Planificado_h"].to_numpy(float), Parada_No_Planificada_h=d["Parada_DSS_h"].to_numpy(float),
+        Tiempo_Operativo_h=d["Operativo_DSS_h"].to_numpy(float), Causa_Parada_No_Planificada=d["Causa_DSS"].to_numpy(),
+        Capacidad_Nominal_bidones_h=d["Capacidad_Nominal_bidones_h"].to_numpy(float),
+        Bidones_Procesados=d["Procesados"].to_numpy(float), Bidones_Conformes=d["Conformes"].to_numpy(float),
+        Bidones_No_Conformes=d["No_conformes"].to_numpy(float)))
+    out["Produccion_Teorica_bidones"] = out["Capacidad_Nominal_bidones_h"] * out["Tiempo_Operativo_h"]
+    return finalizar_df(out)
+
+
+def estimar_despues():
+    """Opción B: estimación del escenario DSS completo con la simulación (iteración más cercana a la mediana)."""
+    s = st.session_state
+    res = s.get("v_res")
+    if res is None or 2 not in res["escenarios"] or "det_dss" not in res:
+        n_it, semilla = int(s.get("w_cfg_iter", 60)), int(s.get("w_cfg_seed", 42))
+        res = ejecutar_experimento(df_activo(), leer_supuestos(), n_it, semilla, [0, 1, 2], lambda *a: None)
+        s.v_res = res
+        s.pop("v_xlsx", None)
+        s.pop("xlsx_total", None)
+    L, _ = kpis_por_iteracion(res["fact"])
+    l2 = L[L.scen == 2]
+    it = int(l2.iloc[(l2["OEE"] - l2["OEE"].median()).abs().argmin()]["it"])
+    df_est = df_desde_detalle(res["det_dss"][it], res["fechas"])
+    tr = L.groupby("scen")["t_resp"].mean()
+    s.despues = dict(modo="simulado", df=df_est, origen="Estimado por simulación, no medido",
+                     archivo=f"DSS completo, iteración {it + 1} de {res['n_it']} (semilla {res['semilla']})",
+                     detalle="Estimado por simulación", ini=df_est["Fecha"].min(), fin=df_est["Fecha"].max(), dias=int(df_est["Fecha"].nunique()),
+                     t_resp_antes=float(tr.get(0, np.nan)), t_resp_desp=float(tr.get(2, np.nan)))
+
+
+def activar_despues(df, origen, archivo, detalle=""):
+    st.session_state.despues = dict(modo="medido", df=df, origen=origen, archivo=archivo, detalle=detalle, ini=df["Fecha"].min(),
+                                    fin=df["Fecha"].max(), dias=int(df["Fecha"].nunique()))
+
+
+def cb_demo_antes_despues():
+    """Demo: Base_01 (operación normal) como antes y Base_03 (después de TPM) como después."""
+    s = st.session_state
+    casos = {c["nombre"][:7]: c for c in listar_casos_prueba()}
+    if "Base_01" not in casos or "Base_03" not in casos:
+        s.aviso = ("err", "No encontré Base_01 y Base_03 en la carpeta de la app.")
+        return
+    a, d = casos["Base_01"], casos["Base_03"]
+    dfa, ea, _ = leer_ruta_cache(str(a["ruta"]), a["ruta"].stat().st_mtime)
+    dfd, ed_, _ = leer_ruta_cache(str(d["ruta"]), d["ruta"].stat().st_mtime)
+    if ea or ed_:
+        s.aviso = ("err", "Alguno de los archivos de la demo no pasó la validación.")
+        return
+    activar_datos(dfa, "Datos sintéticos", a["nombre"], a["titulo"])
+    activar_despues(dfd, "Datos sintéticos", d["nombre"], d["titulo"])
+    s.visto.update({"kpis", "params", "tablero", "decision", "plan", "ejecucion"})
+    s.aviso = ("ok", "Demo cargada: Base_01 es el antes y Base_03 es el después. Los casos se reiniciaron.")
+
+
+def pagina_despues():
+    s = st.session_state
+    abrir_pagina("despues", "Resultados mejorados: situación después del plan de mantenimiento",
+                 "Aquí cargas los datos del periodo después de aplicar el plan (el mismo formato OEE_Diario) y ves el mismo tablero que en el paso 4. "
+                 "Si todavía no los tienes, puedes ver una estimación por simulación, marcada como no medida.")
+    aviso = s.pop("aviso", None)
+    if aviso:
+        caja(aviso[1], aviso[0])
+    op = st.radio("¿De dónde salen los datos del periodo después?",
+                  ["Subir un Excel del periodo después", "Usar un caso de prueba", "Estimado por simulación (DSS completo)"], key="w_des_op")
+    if op.startswith("Subir"):
+        up = st.file_uploader("Archivo .xlsx con la hoja OEE_Diario del periodo después", type=["xlsx"], key="w_up_des")
+        if up is None:
+            s.up_des_id = None
+            s.errores_des = None
+        elif s.get("up_des_id") != up.file_id:
+            s.up_des_id = up.file_id
+            df, errs, avisos = leer_base(io.BytesIO(up.getvalue()))
+            if errs:
+                s.errores_des = errs
+            else:
+                s.errores_des = None
+                activar_despues(df, "Datos de la empresa", up.name, "Archivo subido")
+        if s.get("errores_des"):
+            st.error(f"Encontré {len(s.errores_des)} problema(s) en tu archivo. Corrígelos y vuelve a subirlo.")
+            dfe = pd.DataFrame(s.errores_des)
+            st.dataframe(dfe[["Fila", "Columna", "Problema"]], hide_index=True, width="stretch")
+    elif op.startswith("Usar"):
+        casos = listar_casos_prueba()
+        if not casos:
+            caja("No encontré casos de prueba en la carpeta de la app.", "warn")
+        else:
+            nombres = {c["titulo"]: c for c in casos}
+            if s.get("w_des_caso") not in nombres:
+                s.w_des_caso = next((t for t, c in nombres.items() if c["nombre"].startswith("Base_03")), list(nombres)[0])
+            el = nombres[st.selectbox("Caso de prueba para el periodo después", list(nombres), key="w_des_caso")]
+            if el["caso"]:
+                st.info(f"**Caso:** {el['caso']}")
+            a, b = st.columns(2)
+            if a.button("Usar como periodo después", key="b_des_usar", type="primary", width="stretch"):
+                df, errs, _ = leer_ruta_cache(str(el["ruta"]), el["ruta"].stat().st_mtime)
+                if errs:
+                    st.error("Este archivo no pasó la validación.")
+                    st.dataframe(pd.DataFrame(errs)[["Fila", "Columna", "Problema"]], hide_index=True, width="stretch")
+                else:
+                    activar_despues(df, "Datos sintéticos", el["nombre"], el["titulo"])
+            b.button("Demo: Base_01 como antes y Base_03 como después", key="b_des_demo", width="stretch", on_click=cb_demo_antes_despues,
+                     help="Carga Base_01 en el paso 2 como antes y Base_03 como después. Reinicia los casos.")
+    else:
+        st.write("Usa la simulación Monte Carlo (la misma del paso 10) para estimar cómo quedaría la línea con el DSS completo. "
+                 "No son datos medidos.")
+        if st.button("Generar la estimación", key="b_des_est", type="primary", width="stretch"):
+            with st.spinner("Simulando..."):
+                estimar_despues()
+    d = s.get("despues")
+    st.divider()
+    if d is None:
+        caja("Todavía no hay datos del periodo después. Elige una opción de arriba.", "warn")
+        pie_siguiente("despues", habilitado=False, tip="Carga o estima los datos del periodo después para continuar.")
+        return
+    if d["modo"] == "simulado":
+        caja("<b>Estimado por simulación, no medido.</b> Es una iteración representativa del escenario DSS completo, no datos de la planta.", "warn")
+    else:
+        chip = ('<span class="chip emp">DATOS DE LA EMPRESA</span>' if d["origen"] == "Datos de la empresa"
+                else '<span class="chip sin">DATOS SINTÉTICOS</span>')
+        st.markdown(f'##### Periodo después {chip}', unsafe_allow_html=True)
+    st.caption(f"{d['archivo']} · periodo {periodo_txt(d)} · {d['dias']} días laborables")
+    ant = s.datos
+    if d["modo"] == "medido" and d["origen"] == "Datos de la empresa" and d["ini"] <= ant["fin"]:
+        caja("El periodo después empieza antes de que termine el periodo antes. Revisa que sean periodos distintos.", "warn")
+    render_tablero(d["df"], "des")
+    pie_siguiente("despues")
+
+
+# =============================================================================
+# PASO 9 - COMPARATIVO FINAL
+# =============================================================================
+COMP_IND = ["OEE", "D", "R", "Q", "Pa", "MTBF", "MTTR", "rechazo", "t_resp"]
+
+
+def t_resp_casos():
+    """Minutos promedio entre la creación de un caso y su primera acción registrada (medido en la app)."""
+    mins = []
+    for c in st.session_state.casos:
+        its = [i["ts"] for i in c["intervenciones"] if i.get("ts") is not None]
+        if its:
+            mins.append((min(its) - c["creado"]).total_seconds() / 60.0)
+    return float(np.mean(mins)) if mins else float("nan")
+
+
+def datos_comparativo():
+    """Indicadores antes y después, por estación y Pareto, a partir de los datos activos y del periodo después."""
+    s = st.session_state
+    a, d = s.datos, s.despues
+    ka, kd = kpis_base(a["df"]), kpis_base(d["df"])
+    norm = a["dias"] / d["dias"] if d["dias"] and d["dias"] != a["dias"] else 1.0
+    if d["modo"] == "simulado":
+        tr_a, tr_d = d.get("t_resp_antes", np.nan), d.get("t_resp_desp", np.nan)
+    else:
+        tr_a, tr_d = np.nan, t_resp_casos()
+    ant = {k: ka[k] for k in ("OEE", "D", "R", "Q", "Pa", "MTBF", "MTTR", "rechazo")}
+    des = {k: kd[k] for k in ("OEE", "D", "R", "Q", "Pa", "MTBF", "MTTR", "rechazo")}
+    des["Pa"] = des["Pa"] * norm
+    ant["t_resp"], des["t_resp"] = tr_a, tr_d
+    return dict(antes=ant, despues=des, norm=norm, ga=tabla_estaciones(a["df"]), gd=tabla_estaciones(d["df"]),
+                pa=tabla_pareto(a["df"]), pd_=tabla_pareto(d["df"]))
+
+
+def variacion(k, a, d):
+    """Texto de variación: puntos porcentuales y % para los indicadores en %, unidad y % para el resto."""
+    if a is None or d is None or not np.isfinite(a) or not np.isfinite(d):
+        return "sin dato", None
+    mejora_alta = METAS[k][0] == ">=" if k in METAS else True
+    dif = d - a
+    rel = (d / a - 1) * 100 if a else float("nan")
+    signo = "+" if dif >= 0 else "-"
+    if TIPO[k] == "pct":
+        txt = f"{signo}{n(abs(dif) * 100)} pp ({signo}{n(abs(rel))} %)"
+    else:
+        u = {"h": "h", "min": "min"}.get(TIPO[k], "")
+        txt = f"{signo}{n(abs(dif))} {u} ({signo}{n(abs(rel))} %)"
+    return txt, (dif >= 0) == mejora_alta
+
+
+def fmt_nd(k, x):
+    v = fmt(TIPO[k], x)
+    return "sin dato" if v == "—" else v
+
+
+def tabla_comparativo(dc):
+    filas = []
+    for k in COMP_IND:
+        a, d = dc["antes"][k], dc["despues"][k]
+        txt, bueno = variacion(k, a, d)
+        c = cumple(k, d) if np.isfinite(d) else None
+        filas.append(dict(clave=k, nombre=ETIQ[k] if k != "Pa" else "Parada no planificada", antes=a, despues=d, var=txt, bueno=bueno,
+                          meta=META_TXT[k], cumple=c))
+    return filas
+
+
+def pagina_comparativo():
+    s = st.session_state
+    abrir_pagina("comparativo", "Comparativo final: antes y después",
+                 "Aquí comparas la situación inicial (paso 4) con los resultados mejorados (paso 8) para cada indicador y cada estación, "
+                 "y ves si se cumplen las metas del paso 1.")
+    dc = datos_comparativo()
+    d = s.despues
+    filas = tabla_comparativo(dc)
+    if d["modo"] == "simulado":
+        caja("<b>Estimado por simulación, no medido.</b> El «después» es una iteración representativa del escenario DSS completo.", "warn")
+    if dc["norm"] != 1.0:
+        caja(f"Los periodos tienen distinta cantidad de días ({s.datos['dias']} antes y {d['dias']} después). Las horas de parada del después "
+             f"se normalizaron a {s.datos['dias']} días.", "info")
+    oee_a, oee_d = dc["antes"]["OEE"], dc["despues"]["OEE"]
+    meta = METAS["OEE"][1] * 100
+    dif = (oee_d - oee_a) * 100
+    cumple_txt = "se cumple" if oee_d >= METAS["OEE"][1] else "no se cumple"
+    st.markdown(f'<div class="box {"ok" if oee_d >= METAS["OEE"][1] else "warn"}">El OEE pasó de <b>{n(oee_a * 100)} %</b> a <b>{n(oee_d * 100)} %</b> '
+                f'({"+" if dif >= 0 else "-"}{n(abs(dif))} pp); la meta de {n(meta, 0)} % <b>{cumple_txt}</b>.</div>', unsafe_allow_html=True)
+    st.markdown("##### Tarjetas: antes, después y variación")
+    for fila_cols in (COMP_IND[0:3], COMP_IND[3:6], COMP_IND[6:9]):
+        cols = st.columns(3)
+        for col, k in zip(cols, fila_cols):
+            f = next(x for x in filas if x["clave"] == k)
+            meta_txt = f"Meta {f['meta']} " + ("✓ cumple" if f["cumple"] else "✗ no cumple") if f["cumple"] is not None else f"Meta {f['meta']}"
+            sub = (f"Antes: {fmt_nd(k, f['antes'])}<br>Variación: {f['var']}<br>{meta_txt}")
+            kpi(col, f["nombre"] + " (después)", fmt_nd(k, f["despues"]), sub,
+                ("ok" if f["cumple"] else "bad") if f["cumple"] is not None else None)
+        st.write("")
+    tabs = st.tabs(["Por indicador", "Por estación", "Pareto de paradas"])
+    with tabs[0]:
+        pcts = ["OEE", "D", "R", "Q", "rechazo"]
+        fig = go.Figure()
+        fig.add_bar(x=[envolver(ETIQ[k], 14) for k in pcts], y=[round(dc["antes"][k] * 100, 2) for k in pcts], name="Antes", marker_color=GRIS,
+                    texttemplate="%{y:.1f} %", textposition="outside")
+        fig.add_bar(x=[envolver(ETIQ[k], 14) for k in pcts], y=[round(dc["despues"][k] * 100, 2) for k in pcts], name="Después", marker_color=VERDE,
+                    texttemplate="%{y:.1f} %", textposition="outside")
+        fig.update_yaxes(title="%", range=[0, 118])
+        st.plotly_chart(estilo_fig(fig, 380, "Indicadores en porcentaje: antes y después"), width="stretch", key="g_comp_pct")
+        otros = ["Pa", "MTBF", "MTTR"]
+        fig = go.Figure()
+        for nombre, lado, color in (("Antes", "antes", GRIS), ("Después", "despues", VERDE)):
+            fig.add_bar(x=[envolver("Parada no planificada (h)" if k == "Pa" else f"{ETIQ[k]} (h)", 14) for k in otros],
+                        y=[round(float(dc[lado][k]), 2) for k in otros], name=nombre, marker_color=color,
+                        texttemplate="%{y:.1f}", textposition="outside")
+        fig.update_yaxes(title="horas")
+        st.plotly_chart(estilo_fig(fig, 340, "Horas de parada, MTBF y MTTR: antes y después"), width="stretch", key="g_comp_h")
+    with tabs[1]:
+        fig = go.Figure()
+        xs = [envolver(EST_NOM[e], 16) for e in (1, 2, 3)]
+        fig.add_bar(x=xs, y=[round(dc["ga"].loc[e, "OEE"] * 100, 2) for e in (1, 2, 3)], name="Antes", marker_color=GRIS,
+                    texttemplate="%{y:.1f} %", textposition="outside")
+        fig.add_bar(x=xs, y=[round(dc["gd"].loc[e, "OEE"] * 100, 2) for e in (1, 2, 3)], name="Después", marker_color=VERDE,
+                    texttemplate="%{y:.1f} %", textposition="outside")
+        fig.update_yaxes(title="OEE (%)", range=[0, 90])
+        st.plotly_chart(estilo_fig(fig, 380, "OEE por estación: antes y después"), width="stretch", key="g_comp_est")
+        filas_e = []
+        for e in (1, 2, 3):
+            ga, gd = dc["ga"].loc[e], dc["gd"].loc[e]
+            filas_e.append([EST_NOM[e]] + [f"{n(ga[c] * 100)} % → {n(gd[c] * 100)} %" for c in ("D", "R", "Q", "OEE")]
+                           + [f"{n(ga['Pa'])} h → {n(gd['Pa'] * dc['norm'])} h", f"{n(ga['rech'] * 100)} % → {n(gd['rech'] * 100)} %"])
+        tabla_html(["Estación", "Disponibilidad", "Rendimiento", "Calidad", "OEE", "Parada", "Rechazo"], filas_e)
+    with tabs[2]:
+        pa, pdd = dc["pa"], dc["pd_"].copy()
+        pdd["Horas"] = pdd["Horas"] * dc["norm"]
+        causas = list(pa["Causa"]) + [c for c in pdd["Causa"] if c not in set(pa["Causa"])]
+        fig = go.Figure()
+        for nombre, tabla, color in (("Antes", pa, GRIS), ("Después", pdd, VERDE)):
+            ser = tabla.set_index("Causa")["Horas"].reindex(causas).fillna(0)
+            fig.add_bar(x=[envolver(c, 12) for c in causas], y=ser.round(2), name=nombre, marker_color=color,
+                        texttemplate="%{y:.1f}", textposition="outside")
+        fig.update_yaxes(title="Horas de parada")
+        st.plotly_chart(estilo_fig(fig, 460, "Pareto de paradas por causa: antes y después"), width="stretch", key="g_comp_par")
+    with st.expander("Ver el detalle de los indicadores"):
+        tabla_html(["Indicador", "Antes", "Después", "Variación", "Meta", "Cumple la meta"],
+                   [[f["nombre"], fmt_nd(f["clave"], f["antes"]), fmt_nd(f["clave"], f["despues"]), f["var"], f["meta"],
+                     "sin dato" if f["cumple"] is None else ("Sí" if f["cumple"] else "No")] for f in filas])
+        if np.isnan(dc["antes"]["t_resp"]):
+            st.caption("El tiempo de respuesta antes no se registraba (planilla manual). El después se mide en la app como minutos entre la "
+                       "creación del caso y la primera acción registrada.")
+    pie_siguiente("comparativo")
+
+
+def df_comparativo_export():
+    """Tablas del comparativo para el Excel de exportación (vacías si no hay datos del periodo después)."""
+    s = st.session_state
+    if s.get("despues") is None:
+        return None
+    dc = datos_comparativo()
+    filas = []
+    for f in tabla_comparativo(dc):
+        a, d = f["antes"], f["despues"]
+        k = f["clave"]
+        dif = (d - a) if (np.isfinite(a) and np.isfinite(d)) else np.nan
+        esc = 100 if TIPO[k] == "pct" else 1
+        filas.append({"Indicador": f["nombre"], "Antes": a * esc if np.isfinite(a) else "sin dato", "Después": d * esc if np.isfinite(d) else "sin dato",
+                      "Variación absoluta": dif * esc if np.isfinite(dif) else "sin dato",
+                      "Variación (%)": (d / a - 1) * 100 if (np.isfinite(a) and np.isfinite(d) and a) else "sin dato",
+                      "Unidad": {"pct": "% (variación en pp)", "h": "h", "min": "min"}.get(TIPO[k], ""), "Meta": f["meta"],
+                      "Cumple la meta": "sin dato" if f["cumple"] is None else ("Sí" if f["cumple"] else "No")})
+    est = []
+    for e in (1, 2, 3):
+        for nombre, g in (("Antes", dc["ga"]), ("Después", dc["gd"])):
+            est.append({"Estación": EST_NOM[e], "Periodo": nombre, "Disponibilidad": g.loc[e, "D"], "Rendimiento": g.loc[e, "R"],
+                        "Calidad": g.loc[e, "Q"], "OEE": g.loc[e, "OEE"], "Horas de parada": g.loc[e, "Pa"], "Índice de rechazo": g.loc[e, "rech"]})
+    par = dc["pa"][["Causa", "Horas"]].rename(columns={"Horas": "Horas antes"}).merge(
+        dc["pd_"][["Causa", "Horas"]].rename(columns={"Horas": "Horas después"}), on="Causa", how="outer").fillna(0)
+    d = s.despues
+    info = pd.DataFrame([("Antes", f"{s.datos['archivo']} ({periodo_txt(s.datos)})"),
+                         ("Después", f"{d['archivo']} ({periodo_txt(d)})"),
+                         ("Tipo de datos del después", "Estimado por simulación, no medido" if d["modo"] == "simulado" else "Medido")],
+                        columns=["Dato", "Valor"])
+    return dict(indicadores=pd.DataFrame(filas), estaciones=pd.DataFrame(est), pareto=par, info=info)
+
+
 PAGINAS = dict(inicio=pagina_inicio, kpis=pagina_kpis, datos=pagina_datos, params=pagina_params, tablero=pagina_tablero,
-               decision=pagina_decision, ejecucion=pagina_ejecucion, valid=pagina_valid, export=pagina_export)
+               decision=pagina_decision, plan=pagina_plan, ejecucion=pagina_ejecucion, despues=pagina_despues,
+               comparativo=pagina_comparativo, valid=pagina_valid, export=pagina_export)
 
 
 def inicializar_estado():
@@ -3924,7 +4782,12 @@ def inicializar_estado():
     s.setdefault("d_seed", 7)
     s.setdefault("umb", {})
     s.setdefault("umb_ver", 0)
+    s.setdefault("registro_plan", [])
+    s.setdefault("plan_ov", {})
+    s.setdefault("plan_frec", {k: v for k, v in FREC_DEF.items()})
     por_defecto = {
+        "w_ej_sub": "Checklist del plan", "w_chk_valor": 0.0, "w_chk_fecha": pd.Timestamp.today().date(), "w_chk_accion": "",
+        "w_chk_est": "E1", "w_des_op": "Subir un Excel del periodo después",
         "w_parada_min": 30, "w_rec_n": 2, "w_rec_vent": 1, "w_p_lect": LECT_DEF, "w_p_medio": MEDIO_DEF, "w_p_alto": ALTO_DEF,
         "w_gen_ini": pd.Timestamp("2026-07-01").date(), "w_gen_fin": pd.Timestamp("2026-09-30").date(), "w_gen_sem": 42,
         "w_cfg_iter": 60, "w_cfg_seed": 42, "w_cfg_scen": list(ESCENARIOS_SIM), "w_v_sub": "1. Configuración",

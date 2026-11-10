@@ -11,25 +11,47 @@ Todo el código está en un solo archivo: `app_web_intento_2.py`. Los datos de e
 |---|---|
 | `app_web_intento_2.py` | La app completa. |
 | `requirements.txt` | Dependencias (streamlit, pandas, numpy, plotly, openpyxl). |
-| `Base_OEE_MYPE_Peru_bidones_6_meses_2026.xlsx` | Base de la tesis (ene–jun 2026). |
-| `Base_01 … Base_06 *.xlsx` | Casos de prueba (operación normal, falla crítica en E2, después de TPM, calidad en E3, falta de insumos, otra empresa). Cada uno trae una hoja `Leeme` que la app muestra al elegirlo. |
+| `Base_OEE_MYPE_Peru_bidones_6_meses_2026.xlsx` | Base de la tesis (ene a jun 2026). |
+| `Base_01 ... Base_06 *.xlsx` | Casos de prueba (operación normal, falla crítica en E2, después de TPM, calidad en E3, falta de insumos, otra empresa). Cada uno trae una hoja `Leeme` que la app muestra al elegirlo. |
+| `Escenario_*.xlsx` | Si están en esta carpeta o en la carpeta vecina `Data de validación`, también aparecen en «Casos de prueba» (el Escenario 5 trae errores a propósito). |
 
-## Cómo se usa (menú lateral, un paso por página)
+## Flujo de la app (menú lateral)
 
-Inicio → **1. KPIs de entrada** → **2. Datos** → **3. Parámetros** → **4. Tablero** → **5. Decisión (parte post)** →
-**6. Ejecución y resultante** → **7. Validación (Monte Carlo)** → **8. Exportación**.
+Inicio · **1. KPIs y metas** · **2. Datos** · **3. Parámetros**
 
-* **Datos de tu empresa:** descarga la plantilla Excel, llénala (una fila por estación y día; la hoja *Instrucciones* explica cada
-  columna) y súbela. La app acepta el encabezado en la fila 1 (plantilla) o en la fila 5 (base de la tesis). Si hay errores,
-  los lista con fila y columna y permite descargarlos.
+* **Bloque antes:** **4. Resultados iniciales** (situación inicial, sin el plan de mantenimiento: OEE, D, R, Q, Pareto, por estación y rechazo).
+* **Bloque mantenimiento:** **5. Decisión** (alertas, qué pasó, por qué, qué tan urgente) · **6. Plan de mantenimiento** ·
+  **7. Ejecución y verificación**.
+* **Bloque después:** **8. Resultados mejorados** · **9. Comparativo final** (antes contra después) ·
+  **10. Validación (Monte Carlo)** · **11. Exportación**.
+
+### Qué hace cada paso nuevo o movido
+
+* **6. Plan de mantenimiento.** Dos pestañas: «Mantenimiento autónomo (operario)» y «Mantenimiento planificado (técnico)», por estación.
+  Cada tarea trae: estación, equipo, qué revisar, cómo se mide, criterio de aceptación, frecuencia, responsable (rol), qué hacer si no
+  cumple y tiempo estimado. La frecuencia depende de la criticidad que da la matriz (por defecto: alta = autónomo cada turno y planificado
+  semanal; media = diario y quincenal; baja = semanal y mensual). Si hay un caso abierto del paso 5, su tarea correctiva aparece primero,
+  resaltada, con su plazo. Se puede descargar el checklist en Excel o CSV para imprimirlo.
+  Las frecuencias y los criterios se editan en el paso 3, pestaña «Plan de mantenimiento». Todos los criterios son
+  «(ejemplo, ajustar con la empresa)».
+* **7. Ejecución y verificación.** Sección «Checklist del plan»: se registra el valor medido, la fecha y la acción realizada; la app indica
+  si cumple. Si una medición no cumple, crea o actualiza un caso automáticamente. Sección «Verificación de casos (C4)»: la verificación de
+  siempre (Esperado contra Observado, CERRADO o REABIERTO, NPR actualizado). Los casos que vienen del plan se verifican con una nueva medición.
+* **8. Resultados mejorados.** Tres opciones para los datos del periodo después: subir un segundo Excel (mismo formato OEE_Diario), elegir un
+  caso de prueba (demo: Base_01 como antes y Base_03 como después) o ver una estimación por simulación, marcada como
+  «Estimado por simulación, no medido». Muestra el mismo tablero del paso 4.
+* **9. Comparativo final.** Tarjetas antes, después y variación (puntos y %) con la meta del paso 1, gráficos de barras agrupadas por
+  indicador y por estación, y Pareto de paradas antes y después. Resume en una frase si se cumple la meta de OEE.
+* **11. Exportación.** El Excel incluye, además de lo anterior, el plan de mantenimiento, el registro del plan y el comparativo.
+
+## Datos
+
+* **Datos de tu empresa:** descarga la plantilla Excel, llénala (una fila por estación y día; la hoja *Instrucciones* explica cada columna)
+  y súbela. La app acepta el encabezado en la fila 1 (plantilla) o en la fila 5 (base de la tesis). Si hay errores, los lista con fila y
+  columna y permite descargarlos.
 * **Datos sintéticos:** base de la tesis, casos de prueba o una base nueva generada (periodo y semilla).
-* **Parámetros:** umbrales P10/P90, rangos de sensores (C1), escalas S/O/D, **matriz de criticidad editable** (C3 usa esa
-  matriz), AMEF y supuestos del Monte Carlo. Todo parte de los valores de la tesis y tiene botón para restablecer.
-* **Decisión → Ejecución:** de una alerta se llega a una decisión (qué pasó, por qué, qué tan urgente, qué decido) que crea un
-  *caso*. En el paso 6 se verifica el resultado con los datos del periodo siguiente (Tabla 7): el caso se **cierra** (y C1, C2 y
-  C3 aprenden) o se **reabre** con la siguiente causa por NPR.
-* Los supuestos de simulación no vienen de la base ni de la tesis: están marcados como «supuesto». Los valores del AMEF y de la
-  matriz que no son de la tesis están marcados «(ejemplo)».
+* Los supuestos de simulación no vienen de la base ni de la tesis: están marcados como «supuesto». Los valores del AMEF, de la matriz y del
+  plan que no son de la tesis están marcados «(ejemplo)».
 
 ## Cómo correrla en tu computadora
 
@@ -45,6 +67,15 @@ streamlit run app_web_intento_2.py
 
 Se abre en `http://localhost:8501`. En Windows, si `pip` o `streamlit` no se reconocen, usa
 `py -m pip install -r requirements.txt` y `py -m streamlit run app_web_intento_2.py`.
+
+## Cómo probar el flujo completo
+
+1. En Inicio, pulsa «Probar con datos de ejemplo» (base de la tesis).
+2. Paso 5: elige el día 30/01/2026, la alerta de parada en E2 y confirma la decisión. Se crea el caso C-001 (desgaste de válvula dosificadora,
+   NPR 100).
+3. Paso 6: la tarea T-E2-01 (goteo de la válvula) aparece primero y resaltada con el caso.
+4. Paso 7: registra una medición de T-E2-01 (por ejemplo 3 gotas/min, no cumple) y luego verifica el caso en «Verificación de casos (C4)».
+5. Paso 8: en «Usar un caso de prueba» pulsa «Demo: Base_01 como antes y Base_03 como después» (reinicia los casos) y revisa el paso 9.
 
 ## Cómo subirla a GitHub
 
