@@ -1,0 +1,45 @@
+name: Mantener activa la app AguaBora-DSS
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  visitar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Playwright con Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visitar la app y despertarla si estaba dormida
+        run: |
+          cat > visitar.py << 'EOF'
+          from playwright.sync_api import sync_playwright
+
+          URL = "https://agua-bora-dss.streamlit.app/"
+
+          with sync_playwright() as p:
+              navegador = p.chromium.launch()
+              pagina = navegador.new_page()
+              pagina.goto(URL, timeout=60000)
+              pagina.wait_for_timeout(15000)
+              boton = pagina.get_by_role("button", name="Yes, get this app back up")
+              if boton.count() > 0:
+                  print("La app estaba dormida: se pulsa el botón para despertarla.")
+                  boton.first.click()
+                  pagina.wait_for_timeout(90000)
+                  print("Listo: se esperó 90 segundos a que la app arranque de nuevo.")
+              else:
+                  print("La app ya estaba activa: no hizo falta despertarla.")
+              navegador.close()
+          EOF
+          python visitar.py
